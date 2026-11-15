@@ -1,6 +1,6 @@
 {
   "name": "dsh-pet-link",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "把桌宠 dsh-pet 桥接成 agent 工具，并给宠物一条反向通道：pet_say / pet_chat / pet_todo_add / pet_todo_list / pet_state / pet_watch / pet_look / pet_remind / pet_ring / pet_link_info。",
   "type": "module",
   "main": "index.js",
