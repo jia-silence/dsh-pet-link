@@ -1,0 +1,33 @@
+{
+  "name": "dsh-pet-link",
+  "version": "0.3.0",
+  "description": "把桌宠 dsh-pet 桥接成 agent 工具，并给宠物一条反向通道：pet_say / pet_chat / pet_todo_add / pet_todo_list / pet_state / pet_watch / pet_look / pet_remind / pet_ring / pet_link_info。",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "capture.py",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=20.18",
+    "dsh": ">=0.2.0-rc.2 <0.3.0 || 0.2.2-rc.1"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "pet"
+  ],
+  "license": "MIT"
+}

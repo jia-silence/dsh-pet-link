@@ -1,0 +1,6 @@
+# dsh-pet-link — bundle patch layer
+#
+# 把 dsh-pet-link 声明成 Cordis loader 条目，装进 profile 后随 bundles 一起加载。
+- insert:
+    - id: pet-link
+      name: 'dsh-pet-link'
