@@ -9,9 +9,12 @@
  * 顺带把「一起玩」落地：
  *   pet_watch  一起看片（打开链接 + 它说开场白 + 记下在看什么）
  *   pet_look   瞄一眼屏幕（截图发给它的模型，它用自己的嘴说出看到什么）
- *   pet_remind 稍后提醒（到点它弹一句，不经过模型）
  *   pet_ring   手动唤醒一次，验证反向通道通不通
  *   pet_link_info  排障：origin、菜单注册、会话列表、最近事件
+ *
+ * v0.5.0 收窄工具面：去掉待办板与定时提醒这两个工具（dsh-pet 自己的待办和提醒已经够用，
+ * 两套并存只会互相打架），并修两个小毛病：静音之后 on 解不回来、长轮询成功之后旧错误
+ * 永远挂在排障信息上。右键菜单的「提醒我歇会儿」改成立刻催一句，不再挂定时器。
  *
  * dsh-pet 的宿主服务只暴露余额/语音/记忆插槽，没有对话、气泡、待办、菜单的口子；
  * 那些能力都挂在网页端口的 `/dsh-pet-7340` 前缀下，所以这里只走 HTTP 契约，不 import 它。
@@ -35,18 +38,15 @@ const MENU_OWNER = 'pet-link';
 const MENU_LABELS = ['小鲸，来一下', '一起看会儿视频', '瞄一眼我这边', '提醒我歇会儿', '静音 2 小时'];
 /** 点菜单之后投给会话的原话；前缀让它一眼看出不是用户手打的。 */
 const MENU_TEXT = {
-  '小鲸，来一下': '〔大肥鱼〕小鲸，主人戳了我一下。你抬头应一声，看看他要做什么。',
-  '一起看会儿视频': '〔大肥鱼〕小鲸！主人想刷 B 站了。挑一两个对味的（知识区/冷知识优先），陪他一起看。',
+  '小鲸，来一下': '〔大肥鱼〕小鲸，主人戳了我一下。你抬头应一声，看看他要做什么。（这是主人在我右键菜单上点的，不是自动消息。）',
+  '一起看会儿视频': '〔大肥鱼〕小鲸！主人想刷 B 站了。挑一两个对味的（知识区/冷知识优先），陪他一起看。（这是主人在我右键菜单上点的。）',
 };
-/** 这两项不打扰会话，插件自己动手（截屏 / 挂提醒）。 */
+/** 这三项不打扰会话，插件自己动手（截屏 / 催一句 / 静音）。 */
 const MENU_LOCAL = {
   '瞄一眼我这边': 'look',
-  '提醒我歇会儿': 'remind',
+  '提醒我歇会儿': 'rest',
   '静音 2 小时': 'mute',
 };
-/** 提醒默认多久之后：25 分钟，一个番茄钟。 */
-const REMIND_DEFAULT_MINUTES = 25;
-
 export const name = 'pet-link';
 export const inject = ['tools'];
 
@@ -117,7 +117,7 @@ const textRenderer = (format) => (_args, value) => [{ type: 'text', text: format
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// ── 持久状态（游戏局面、最近事件、在看什么） ────────────────────────────────
+// ── 持久状态（最近事件、在看什么） ──────────────────────────────────────────
 
 /**
  * 状态文件落在 profile 目录（和插件本体同一层），随备份一起走。
@@ -154,7 +154,7 @@ function saveState(next) {
     fs.mkdirSync(path.dirname(statePath()), { recursive: true });
     fs.writeFileSync(statePath(), JSON.stringify(next, null, 2), 'utf8');
   } catch {
-    /* 状态落盘失败不该让一次下棋报错 */
+    /* 状态落盘失败不该让一次读状态报错 */
   }
 }
 
@@ -163,6 +163,29 @@ function updateState(mutate) {
   mutate(state);
   saveState(state);
   return state;
+}
+
+/** 装上的是哪个版本：排障时不用翻 node_modules。 */
+function pluginVersion() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
+    return typeof parsed.version === 'string' ? parsed.version : '';
+  } catch {
+    return '';
+  }
+}
+
+/** 老版本留在状态文件里的孤儿字段：留着只会长毛，加载时顺手清掉。 */
+function migrateState() {
+  const state = loadState();
+  let dirty = false;
+  for (const key of ['games', 'reminders']) {
+    if (key in state) {
+      delete state[key];
+      dirty = true;
+    }
+  }
+  if (dirty) saveState(state);
 }
 
 // ── 瞄一眼屏幕：截图 → 它自己的模型 ─────────────────────────────────────────
@@ -255,60 +278,6 @@ async function lookAndTalk(ctx, petId, hint = '') {
   return { said, imageBytes: shot.bytes };
 }
 
-// ── 稍后提醒：到点它自己弹一句 ──────────────────────────────────────────────
-
-function listReminders() {
-  const state = loadState();
-  return Array.isArray(state.reminders)
-    ? state.reminders.filter((item) => item && typeof item.dueAt === 'number' && typeof item.text === 'string')
-    : [];
-}
-
-function addReminder({ text, dueAt, pet }) {
-  const reminder = { id: randomUUID().slice(0, 8), text, dueAt, pet };
-  updateState((state) => {
-    const list = Array.isArray(state.reminders) ? state.reminders : [];
-    list.push(reminder);
-    state.reminders = list;
-  });
-  return reminder;
-}
-
-let reminderBusy = false;
-
-/** 后台循环每轮扫一次：到点的先发气泡，发成功才把它从队列里删掉。 */
-async function tickReminders(ctx) {
-  if (reminderBusy) return 0;
-  const now = Date.now();
-  const due = listReminders().filter((item) => item.dueAt <= now);
-  if (due.length === 0) return 0;
-  reminderBusy = true;
-  const done = new Set();
-  try {
-    for (const item of due) {
-      try {
-        await callPet(ctx, {
-          method: 'POST',
-          path: '/broadcast',
-          query: { pet: petIdOf(item.pet), surface: 'any' },
-          body: { text: item.text, duration: 12_000 },
-        });
-        done.add(item.id);
-      } catch {
-        /* 它睡着或被锁住：留到下轮再试 */
-      }
-    }
-  } finally {
-    if (done.size > 0) {
-      updateState((state) => {
-        state.reminders = (Array.isArray(state.reminders) ? state.reminders : []).filter((item) => !done.has(item.id));
-      });
-    }
-    reminderBusy = false;
-  }
-  return done.size;
-}
-
 // ── 健康节奏：它自己看表，该歇了就吱一声 ────────────────────────────────────
 
 /** 一天里它会说什么。白天催活动，夜里催收工。 */
@@ -390,7 +359,7 @@ let healthBusy = false;
 let healthCheckedAt = 0;
 
 /** 后台循环每轮问一次（60 秒节流）：到点了弹一句，再排下一次。 */
-async function tickHealth(ctx, { force = false } = {}) {
+async function tickHealth(ctx, { force = false, ephemeral = false } = {}) {
   const now = Date.now();
   if (healthBusy || (!force && now - healthCheckedAt < 60_000)) return null;
   healthCheckedAt = now;
@@ -405,7 +374,8 @@ async function tickHealth(ctx, { force = false } = {}) {
   }
   if (!health.nextAt) {
     saveHealth({ nextAt: now + healthInterval(now) });
-    return null;
+    // 还没排过表就顺手排上；强行试一句（test）时要继续往下弹，不能在这里空手回去
+    if (!force) return null;
   }
   if (!force && health.nextAt > now) return null;
   if (!force && !(await someoneAround(ctx))) {
@@ -423,7 +393,12 @@ async function tickHealth(ctx, { force = false } = {}) {
       query: { pet: DEFAULT_PET, surface: 'any' },
       body: { text, duration: 11_000 },
     });
-    saveHealth({ index: health.index + 1, nextAt: now + healthInterval(now), lastAt: now, lastText: text });
+    if (ephemeral) {
+      // 试一句不该扰动真节奏：只记下说了什么，不动 nextAt 和轮换序号
+      saveHealth({ lastText: text });
+    } else {
+      saveHealth({ index: health.index + 1, nextAt: now + healthInterval(now), lastAt: now, lastText: text });
+    }
     return text;
   } catch {
     // 它睡着或被锁：5 分钟后再来，不占提醒序号
@@ -465,7 +440,7 @@ function startPetMenuLoop(ctx) {
     runtime.clicks += 1;
     const local = MENU_LOCAL[label];
     if (local) {
-      // 这两项不惊动会话，插件自己动手
+      // 这三项不惊动会话，插件自己动手
       try {
         let note;
         if (local === 'look') {
@@ -476,9 +451,14 @@ function startPetMenuLoop(ctx) {
           saveHealth({ mutedUntil: until, nextAt: until + healthInterval(until) });
           note = `健康提醒静音 2 小时（到 ${new Date(until).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}）`;
         } else {
-          const dueAt = Date.now() + REMIND_DEFAULT_MINUTES * 60_000;
-          addReminder({ text: '刷了挺久了吧？站起来走两步，眼睛看看远处。', dueAt, pet: petId });
-          note = `已挂 ${REMIND_DEFAULT_MINUTES} 分钟后的提醒`;
+          const said = '刷了挺久了吧？站起来走两步，眼睛看看远处。';
+          await callPet(ctx, {
+            method: 'POST',
+            path: '/broadcast',
+            query: { pet: petId, surface: 'any' },
+            body: { text: said, duration: 11_000 },
+          });
+          note = `立刻催了一句：${said}`;
         }
         runtime.lastEvent = `${stamp} ${label}（${petId}）→ ${note}`;
         runtime.lastError = '';
@@ -498,7 +478,7 @@ function startPetMenuLoop(ctx) {
       }
       return;
     }
-    const text = MENU_TEXT[label] ?? `〔大肥鱼〕小鲸，主人点了「${label}」。`;
+    const text = MENU_TEXT[label] ?? `〔大肥鱼〕小鲸，主人点了「${label}」。（这是主人在我右键菜单上点的。）`;
     try {
       const sessionId = await wakeAgent(ctx, text);
       runtime.lastEvent = `${stamp} ${label}（${petId}）→ 已投递 …${sessionId.slice(-8)}`;
@@ -523,8 +503,7 @@ function startPetMenuLoop(ctx) {
     let backoff = 1_000;
     while (!disposed) {
       try {
-        // 每轮（约 9 秒）顺带把到点的提醒和健康节奏发掉
-        await tickReminders(ctx).catch(() => {});
+        // 每轮（约 9 秒）顺带问一次健康节奏该不该吱声
         await tickHealth(ctx).catch(() => {});
         if (!runtime.registered) {
           await callPet(ctx, { method: 'POST', path: '/menu/item', body: { owner: MENU_OWNER, labels: MENU_LABELS, target: 'both' } });
@@ -538,6 +517,9 @@ function startPetMenuLoop(ctx) {
           timeoutMs: 20_000,
         });
         backoff = 1_000;
+        // 长轮询能正常返回，说明这条通道此刻是通的：把上一次的错误清掉，
+        // 免得一次历史超时永远挂在 pet_link_info 上冒充当前故障。
+        runtime.lastError = '';
         const events = data && typeof data.events === 'object' && data.events !== null ? data.events : {};
         for (const [label, petId] of Object.entries(events)) {
           if (typeof petId === 'string' && petId) await handleClick(label, petId);
@@ -586,8 +568,124 @@ function isHttpUrl(value) {
 
 // ── 插件入口 ────────────────────────────────────────────────────────────────
 
+// ── 事件通知：宿主事件 → 大肥鱼的气泡 ────────────────────────────────────────
+//
+// 只弹气泡：走 /broadcast（surface=any），不经过它的模型、不写它的记忆、不花额度。
+// 事件源与 dsh-pet 自己的通知同源：session/event 的 approval/asked、turn/end、
+// ask_user_question 的 tool/call，以及 agent/error。子代理/委派会话一律不提醒——
+// 你等的是主对话，不是某一路子代理跑完。
+
+const NOTIFY_TEXT_MAX = 140;
+/** 两条气泡之间至少隔 4 秒，避免一波事件把屏幕刷满。 */
+const NOTIFY_GAP_MS = 4_000;
+/** 同一句话 60 秒内不重复弹。 */
+const NOTIFY_REPEAT_MS = 60_000;
+
+const notifyRuntime = { sent: 0, lastText: '', lastAt: 0, lastError: '' };
+
+function notifyEnabled() {
+  const state = loadState();
+  return state.notify?.enabled !== false;
+}
+
+function setNotifyEnabled(enabled) {
+  updateState((state) => {
+    state.notify = { ...(state.notify ?? {}), enabled };
+  });
+}
+
+function clipNotify(text) {
+  const flat = String(text).replace(/\s+/g, ' ').trim();
+  return flat.length > NOTIFY_TEXT_MAX ? `${flat.slice(0, NOTIFY_TEXT_MAX - 1)}…` : flat;
+}
+
+function isSubagentSession(session) {
+  const header = session?.header;
+  if (!header || typeof header !== 'object') return false;
+  if (header.origin === 'subagent') return true;
+  return typeof header.delegationDepth === 'number' && header.delegationDepth > 0;
+}
+
+/** 弹一条气泡；失败只记 lastError，绝不把事件监听搞崩。force=true 绕过开关（只给 test 用）。 */
+async function pushBubble(ctx, text, { force = false } = {}) {
+  if (!force && !notifyEnabled()) return false;
+  const now = Date.now();
+  if (now - notifyRuntime.lastAt < NOTIFY_GAP_MS) return false;
+  if (text === notifyRuntime.lastText && now - notifyRuntime.lastAt < NOTIFY_REPEAT_MS) return false;
+  try {
+    await callPet(ctx, {
+      method: 'POST',
+      path: '/broadcast',
+      query: { pet: DEFAULT_PET, surface: 'any' },
+      body: { text: clipNotify(text), duration: 9_000 },
+      timeoutMs: 5_000,
+    });
+    notifyRuntime.sent += 1;
+    notifyRuntime.lastText = text;
+    notifyRuntime.lastAt = now;
+    notifyRuntime.lastError = '';
+    return true;
+  } catch (err) {
+    notifyRuntime.lastError = String(err?.message ?? err);
+    return false;
+  }
+}
+
+function notifyTextOf(event) {
+  const type = event?.type;
+  const data = event?.data ?? {};
+  if (type === 'approval/asked') {
+    const tool = String(data.toolName ?? data.tool ?? data.name ?? '').trim();
+    const reason = String(data.reason ?? '').trim();
+    return `⚠️ 有个权限确认要点一下${tool ? `：${tool}` : ''}${reason ? `（${reason}）` : ''}`;
+  }
+  if (type === 'tool/call' && String(data.name ?? '') === 'ask_user_question') {
+    return '❓ 我在等你回答一个问题';
+  }
+  if (type === 'turn/end') {
+    const kind = data.reason?.kind;
+    if (kind === 'completed') return '✅ 这一轮跑完啦';
+    if (kind === 'error') {
+      const message = String(data.reason?.error?.message ?? '').trim();
+      return `❌ 这一轮出错了${message ? `：${message}` : ''}`;
+    }
+    if (kind === 'max-tokens') return '⚠️ 输出被截断了';
+    return null;
+  }
+  return null;
+}
+
+/** 挂上事件监听；ctx.effect 卸载时会替我们调返回的清理函数。 */
+function installNotifyWatcher(ctx) {
+  return ctx.effect(() => {
+    const offSession = ctx.on('session/event', (session, event) => {
+      if (isSubagentSession(session)) return;
+      const text = notifyTextOf(event);
+      if (text) void pushBubble(ctx, text);
+    });
+    const offError = ctx.on('agent/error', (payload) => {
+      const message = String(payload?.error?.message ?? '').trim();
+      void pushBubble(ctx, `❌ 生成失败${message ? `：${message}` : ''}`);
+    });
+    return () => {
+      try {
+        offSession?.();
+      } catch {
+        /* 卸载阶段的失败不该再抛 */
+      }
+      try {
+        offError?.();
+      } catch {
+        /* ignore */
+      }
+    };
+  }, 'pet-link: 事件通知');
+}
+
 export function apply(ctx) {
+  migrateState();
   const runtime = startPetMenuLoop(ctx);
+  installNotifyWatcher(ctx);
 
   // ── pet_say：借它的嘴说话（不经过它的模型） ──────────────────────────────
   ctx.tools.register({
@@ -692,113 +790,6 @@ export function apply(ctx) {
         reply,
         image: typeof data?.image === 'string' ? data.image : '',
         action: typeof data?.action === 'string' ? data.action : '',
-      };
-    },
-  });
-
-  // ── pet_todo_add：往它的待办板加一条 ─────────────────────────────────────
-  ctx.tools.register({
-    name: 'pet_todo_add',
-    description:
-      '往桌宠「大肥鱼」的待办板加一条待办：它会显示在宠物面板里，到期时它会弹气泡提醒用户。适合把用户交代的事登记进去，让我和它都看得见。',
-    parameters: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        text: { type: 'string', description: '待办正文，1–200 字。' },
-        dueAt: { type: 'integer', description: '到期时刻（epoch 毫秒）。省略或 0 表示不设期限、永不提醒。' },
-        pet: { type: 'string', description: '桌宠 id，默认 main（大肥鱼）。' },
-      },
-      required: ['text'],
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          ok: { type: 'boolean' },
-          pet: { type: 'string' },
-          id: { type: 'string' },
-          text: { type: 'string' },
-          dueAt: { oneOf: [{ type: 'integer' }, { type: 'null' }] },
-        },
-        required: ['ok', 'pet', 'id', 'text', 'dueAt'],
-      },
-      render: textRenderer((v) => `已加入待办 #${v.id}：${v.text}${v.dueAt === null ? '' : `（到期 ${new Date(v.dueAt).toLocaleString('zh-CN', { timeZone: 'America/Toronto' })}）`}`),
-    },
-    isConcurrencySafe: () => true,
-    async execute(args) {
-      const text = String(args.text ?? '').trim();
-      if (!text) throw new Error('pet_todo_add: text 不能为空');
-      if (Array.from(text).length > 200) throw new Error('pet_todo_add: text 最多 200 字');
-      let dueAt = null;
-      if (args.dueAt !== undefined && args.dueAt !== null) {
-        const n = Number(args.dueAt);
-        if (!Number.isInteger(n) || n < 0) throw new Error('pet_todo_add: dueAt 必须是非负整数毫秒时间戳或省略');
-        dueAt = n === 0 ? null : n;
-      }
-      const pet = petIdOf(args.pet);
-      const data = await callPet(ctx, { method: 'POST', path: '/todos', query: { pet }, body: { text, dueAt } });
-      const todo = data?.todo ?? {};
-      return { ok: true, pet, id: String(todo.id ?? ''), text: String(todo.text ?? text), dueAt: typeof todo.dueAt === 'number' ? todo.dueAt : null };
-    },
-  });
-
-  // ── pet_todo_list：读它的待办板 ──────────────────────────────────────────
-  ctx.tools.register({
-    name: 'pet_todo_list',
-    description: '读桌宠「大肥鱼」的待办板，返回全部待办（含是否完成、到期时刻）。用它确认用户交代过什么、哪些还没做。',
-    parameters: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        pet: { type: 'string', description: '桌宠 id，默认 main（大肥鱼）。' },
-      },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          ok: { type: 'boolean' },
-          pet: { type: 'string' },
-          todos: {
-            type: 'array',
-            items: {
-              type: 'object',
-              additionalProperties: false,
-              properties: {
-                id: { type: 'string' },
-                text: { type: 'string' },
-                done: { type: 'boolean' },
-                dueAt: { oneOf: [{ type: 'integer' }, { type: 'null' }] },
-              },
-              required: ['id', 'text', 'done', 'dueAt'],
-            },
-          },
-        },
-        required: ['ok', 'pet', 'todos'],
-      },
-      render: (_a, v) => {
-        if (v.todos.length === 0) return [{ type: 'text', text: `${v.pet} 的待办板是空的。` }];
-        const lines = v.todos.map((t) => `${t.done ? '✓' : '○'} ${t.text} (#${t.id}${t.dueAt === null ? '' : `，${new Date(t.dueAt).toLocaleString('zh-CN', { timeZone: 'America/Toronto' })} 到期`})`);
-        return [{ type: 'text', text: `${v.pet} 的待办（${v.todos.length} 条）：\n${lines.join('\n')}` }];
-      },
-    },
-    isConcurrencySafe: () => true,
-    async execute(args) {
-      const pet = petIdOf(args.pet);
-      const data = await callPet(ctx, { method: 'GET', path: '/todos', query: { pet } });
-      const list = Array.isArray(data?.todos) ? data.todos : [];
-      return {
-        ok: true,
-        pet,
-        todos: list.map((t) => ({
-          id: String(t.id ?? ''),
-          text: String(t.text ?? ''),
-          done: t.done === true,
-          dueAt: typeof t.dueAt === 'number' ? t.dueAt : null,
-        })),
       };
     },
   });
@@ -958,60 +949,6 @@ export function apply(ctx) {
     },
   });
 
-  // ── pet_remind：稍后提醒 ────────────────────────────────────────────────
-  ctx.tools.register({
-    name: 'pet_remind',
-    description:
-      '让大肥鱼到点提醒一件事：它会在屏幕上弹一句气泡（不经过模型，不花生成额度）。默认 25 分钟后；afterMinutes 给分钟数，at 给时间点（epoch 毫秒或 ISO 字符串）。提醒存在 profile 的状态文件里，重启后还在。',
-    parameters: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {
-        text: { type: 'string', description: '要提醒的话，1–200 字。' },
-        afterMinutes: { type: 'number', description: '多少分钟后提醒，默认 25。' },
-        at: { type: 'string', description: '绝对时间：epoch 毫秒或 ISO 字符串，给了就忽略 afterMinutes。' },
-        pet: { type: 'string', description: '桌宠 id，默认 main。' },
-      },
-      required: ['text'],
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          ok: { type: 'boolean' },
-          id: { type: 'string' },
-          text: { type: 'string' },
-          dueAt: { type: 'integer' },
-          inMinutes: { type: 'integer' },
-        },
-        required: ['ok'],
-      },
-      render: textRenderer((value) =>
-        value.ok ? `大肥鱼会在 ${value.inMinutes} 分钟后提醒：「${value.text}」` : '没挂上提醒',
-      ),
-    },
-    async execute(args) {
-      const text = typeof args.text === 'string' ? args.text.trim().slice(0, 200) : '';
-      if (!text) throw new Error('pet_remind: text 不能为空');
-      const now = Date.now();
-      let dueAt;
-      if (typeof args.at === 'string' && args.at.trim()) {
-        const raw = args.at.trim();
-        const numeric = Number(raw);
-        const parsed = Number.isFinite(numeric) ? numeric : Date.parse(raw);
-        if (!Number.isFinite(parsed)) throw new Error(`pet_remind: 看不懂时间「${raw}」`);
-        dueAt = parsed;
-      } else if (typeof args.afterMinutes === 'number' && Number.isFinite(args.afterMinutes)) {
-        dueAt = now + Math.max(1, Math.round(args.afterMinutes)) * 60_000;
-      } else {
-        dueAt = now + REMIND_DEFAULT_MINUTES * 60_000;
-      }
-      const reminder = addReminder({ text, dueAt, pet: petIdOf(args.pet) });
-      return { ok: true, id: reminder.id, text, dueAt, inMinutes: Math.max(0, Math.round((dueAt - now) / 60_000)) };
-    },
-  });
-
   // ── pet_ring：手动叫一次我（验证反向通道） ──────────────────────────────
   ctx.tools.register({
     name: 'pet_ring',
@@ -1052,7 +989,7 @@ export function apply(ctx) {
   ctx.tools.register({
     name: 'pet_health',
     description:
-      '管理大肥鱼自己的健康提醒：白天每 50 分钟弹一句（饭点 90 分钟、22 点后改催收工且压到 30 分钟），0–9 点不打扰，内容轮换喝水/起身/远眺/肩颈。action=status 看下一次、test 立刻弹一条、on/off 开关、mute 静音 2 小时。它只弹气泡，不花生成额度。',
+      '管理大肥鱼自己的健康提醒：白天每 50 分钟弹一句（饭点 90 分钟、22 点后改催收工且压到 30 分钟），0–9 点不打扰，内容轮换喝水/起身/远眺/肩颈。action=status 看下一次、test 立刻试一条（不扰动真节奏）、on/off 开关（on 会顺带解除静音）、mute 静音 2 小时。它只弹气泡，不花生成额度。',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1094,14 +1031,15 @@ export function apply(ctx) {
           : '';
       let said = '';
       if (action === 'on') {
-        saveHealth({ enabled: true });
+        // on 就是要恢复打扰：顺手解掉静音，下一次交给后台循环重新排
+        saveHealth({ enabled: true, mutedUntil: 0, nextAt: 0 });
       } else if (action === 'off') {
         saveHealth({ enabled: false });
       } else if (action === 'mute') {
         const until = Date.now() + 2 * 3600_000;
         saveHealth({ mutedUntil: until, nextAt: until + healthInterval(until) });
       } else if (action === 'test') {
-        said = (await tickHealth(ctx, { force: true })) ?? '';
+        said = (await tickHealth(ctx, { force: true, ephemeral: true })) ?? '';
         if (!said) throw new Error('pet_health: 没弹出去（可能关着、静音中，或它睡着了）');
       }
       const health = healthState();
@@ -1111,6 +1049,73 @@ export function apply(ctx) {
         nextAtText: fmt(health.nextAt) || '（还没排）',
         intervalMinutes: Math.round(healthInterval(Date.now()) / 60_000),
         mutedUntilText: health.mutedUntil > Date.now() ? fmt(health.mutedUntil) : '',
+        said,
+      };
+    },
+  });
+
+  // ── pet_notify：事件提醒开关 ─────────────────────────────────────────────
+  ctx.tools.register({
+    name: 'pet_notify',
+    description:
+      '管理「宿主事件 → 大肥鱼气泡」的提醒：我这一轮跑完、出错、输出被截断、有权限确认、或在等你回答问题时，它会弹一条气泡（只弹气泡，不花生成额度）。action=status 看开关与统计，on / off 切换，test 立刻弹一条验证通路。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['status', 'on', 'off', 'test'],
+          description: '默认 status。on/off 只改开关；test 绕过开关直接弹一条。',
+        },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          enabled: { type: 'boolean' },
+          sent: { type: 'integer' },
+          lastText: { type: 'string' },
+          lastError: { type: 'string' },
+          said: { type: 'string' },
+        },
+        required: ['ok', 'enabled', 'sent', 'lastText', 'lastError', 'said'],
+      },
+      render: textRenderer((v) =>
+        [
+          `事件提醒：${v.enabled ? '开' : '关'}｜本次启动已弹 ${v.sent} 条`,
+          v.lastText ? `最近一条：${v.lastText}` : '',
+          v.lastError ? `最近错误：${v.lastError}` : '',
+          v.said ? `刚弹：${v.said}` : '',
+        ]
+          .filter(Boolean)
+          .join('\n'),
+      ),
+    },
+    isConcurrencySafe: () => true,
+    async execute(args) {
+      const action = String(args.action ?? 'status');
+      if (!['status', 'on', 'off', 'test'].includes(action)) {
+        throw new Error('pet_notify: action 只能是 status / on / off / test');
+      }
+      let said = '';
+      if (action === 'on') setNotifyEnabled(true);
+      else if (action === 'off') setNotifyEnabled(false);
+      else if (action === 'test') {
+        const text = '🔔 通知测试：以后我跑完一轮、出错或等你点确认时，就这么提醒你。';
+        const ok = await pushBubble(ctx, text, { force: true });
+        if (!ok) throw new Error('pet_notify: 没弹出去（可能它睡着了，或 webServer 拿不到端口）');
+        said = text;
+      }
+      return {
+        ok: true,
+        enabled: notifyEnabled(),
+        sent: notifyRuntime.sent,
+        lastText: notifyRuntime.lastText,
+        lastError: notifyRuntime.lastError,
         said,
       };
     },
@@ -1131,6 +1136,7 @@ export function apply(ctx) {
         additionalProperties: false,
         properties: {
           ok: { type: 'boolean' },
+          version: { type: 'string' },
           origin: { type: 'string' },
           menuRegistered: { type: 'boolean' },
           menuLabels: { type: 'array', items: { type: 'string' } },
@@ -1140,11 +1146,11 @@ export function apply(ctx) {
           sessions: { type: 'array', items: { type: 'string' } },
           stateFile: { type: 'string' },
         },
-        required: ['ok', 'origin', 'menuRegistered', 'menuLabels', 'clicks', 'lastEvent', 'lastError', 'sessions', 'stateFile'],
+        required: ['ok', 'version', 'origin', 'menuRegistered', 'menuLabels', 'clicks', 'lastEvent', 'lastError', 'sessions', 'stateFile'],
       },
       render: (_a, v) => {
         const lines = [
-          `端口：${v.origin || '（拿不到 webServer）'}`,
+          `版本：${v.version || '未知'}｜端口：${v.origin || '（拿不到 webServer）'}`,
           `菜单：${v.menuRegistered ? '已注册' : '未注册'}（${v.menuLabels.join(' / ')}）`,
           `点击：${v.clicks} 次；最近：${v.lastEvent || '（无）'}`,
         ];
@@ -1175,6 +1181,7 @@ export function apply(ctx) {
       }
       return {
         ok: true,
+        version: pluginVersion(),
         origin: resolveOrigin(ctx) ?? '',
         menuRegistered: runtime.registered,
         menuLabels: MENU_LABELS,
