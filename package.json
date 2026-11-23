@@ -1,7 +1,7 @@
 {
   "name": "dsh-pet-link",
-  "version": "0.6.0",
-  "description": "把桌宠 dsh-pet 桥接成 agent 工具，并给宠物一条反向通道：pet_say / pet_chat / pet_state / pet_watch / pet_look / pet_health / pet_notify / pet_ring / pet_link_info。宿主事件（回合结束、权限确认、等问题、生成失败）也会让桌宠弹气泡提醒。",
+  "version": "0.7.0",
+  "description": "把桌宠 dsh-pet 桥接成 agent 工具，并给宠物一条反向通道：pet_say / pet_chat / pet_state / pet_watch / pet_look / pet_health / pet_notify / pet_ring / pet_link_info。宿主事件（回合结束、权限确认、等问题、生成失败）会让桌宠弹气泡提醒；健康提醒为钟点制（每小时 :00 / :40），按半夜 / 白天 / 夜间三段轮换。",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -10,6 +10,7 @@
   },
   "files": [
     "index.js",
+    "schedule.js",
     "capture.py",
     "cordis.patch.yml",
     "README.md"

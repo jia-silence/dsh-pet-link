@@ -14,7 +14,10 @@
  *
  * v0.5.0 收窄工具面：去掉待办板与定时提醒这两个工具（dsh-pet 自己的待办和提醒已经够用，
  * 两套并存只会互相打架），并修两个小毛病：静音之后 on 解不回来、长轮询成功之后旧错误
- * 永远挂在排障信息上。右键菜单的「提醒我歇会儿」改成立刻催一句，不再挂定时器。
+ * 永远挂在排障信息上。
+ *
+ * v0.7.0 健康提醒改钟点制：每小时 :00 和 :40 各一次、全天不停，按半夜/白天/夜间三段
+ * 换三套话；右键菜单去掉「提醒我歇会儿」——提醒归插件自动做，不再需要手动催。
  *
  * dsh-pet 的宿主服务只暴露余额/语音/记忆插槽，没有对话、气泡、待办、菜单的口子；
  * 那些能力都挂在网页端口的 `/dsh-pet-7340` 前缀下，所以这里只走 HTTP 契约，不 import 它。
@@ -27,6 +30,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { GRID_TEXT, SLOT_MINUTES, nextSlot, poolFor, segmentLabel } from './schedule.js';
+
 const ROUTE_PREFIX = '/dsh-pet-7340';
 const DEFAULT_PET = 'main';
 const PET_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
@@ -35,16 +40,15 @@ const SURFACES = ['any', 'web', 'desktop', 'both'];
 
 /** 右键菜单 owner（一个 owner 一份整体覆盖的列表）。 */
 const MENU_OWNER = 'pet-link';
-const MENU_LABELS = ['小鲸，来一下', '一起看会儿视频', '瞄一眼我这边', '提醒我歇会儿', '静音 2 小时'];
+const MENU_LABELS = ['小鲸，来一下', '一起看会儿视频', '瞄一眼我这边', '静音 2 小时'];
 /** 点菜单之后投给会话的原话；前缀让它一眼看出不是用户手打的。 */
 const MENU_TEXT = {
   '小鲸，来一下': '〔大肥鱼〕小鲸，主人戳了我一下。你抬头应一声，看看他要做什么。（这是主人在我右键菜单上点的，不是自动消息。）',
   '一起看会儿视频': '〔大肥鱼〕小鲸！主人想刷 B 站了。挑一两个对味的（知识区/冷知识优先），陪他一起看。（这是主人在我右键菜单上点的。）',
 };
-/** 这三项不打扰会话，插件自己动手（截屏 / 催一句 / 静音）。 */
+/** 这两项不打扰会话，插件自己动手（截屏 / 静音）。 */
 const MENU_LOCAL = {
   '瞄一眼我这边': 'look',
-  '提醒我歇会儿': 'rest',
   '静音 2 小时': 'mute',
 };
 export const name = 'pet-link';
@@ -280,7 +284,10 @@ async function lookAndTalk(ctx, petId, hint = '') {
 
 // ── 健康节奏：它自己看表，该歇了就吱一声 ────────────────────────────────────
 
-/** 一天里它会说什么。白天催活动，夜里催收工。 */
+/**
+ * 一天里它会说什么。白天催活动，夜里催收工，半夜劝睡。
+ * 按 schedule.js 的钟点网格分段轮换，段与段之间各走各的计数器。
+ */
 const HEALTH_POOL = {
   day: [
     '喝口温水吧，别干着。',
@@ -289,42 +296,44 @@ const HEALTH_POOL = {
     '伸个懒腰，肩胛骨往后收一下。',
     '眨几下眼，盯屏幕太久了。',
     '脖子左右各转三下，慢一点。',
+    '站起接杯水，顺便把窗户开条缝。',
+    '十指张开再握紧，来回五下。',
+    '走到窗边看两眼远处的楼。',
+    '靠着椅背深呼吸三次，肩膀放下来。',
+    '坐着把腿伸直、脚尖勾一勾。',
+    '手里这行收个尾，起身再回来。',
   ],
   night: [
     '已经挺晚了，手上这点收个尾就停吧。',
     '该收工了。明天早上脑子清楚，比今晚多熬一小时值。',
     '眼睛酸了吧？关灯躺着比坐着强。',
+    '知道你还想多做点，今天到这儿已经够了。',
+    '累了就是累了，别硬撑；卡住了也先放着。',
+    '关屏幕之前先喝口水，别空着睡。',
+    '睡前别再刷手机了，让眼睛真的歇一会儿。',
+    '明天的事明天再说，它跑不掉。',
+    '我在这儿，但不催你——收工就好。',
+  ],
+  late: [
+    '这个点，是真的该睡了。',
+    '别撑了，明天补不回来的。',
+    '关电脑，去洗脸，该休息了。',
+    '你现在做的这件事，明天做只会更快。',
+    '再熬下去就不是努力了，是拿身体换。去睡觉。',
   ],
 };
-
-/** 0–9 点不打扰；12/18 点饭点拉长间隔；22 点之后改催收工。 */
-function healthInterval(now) {
-  const hour = new Date(now).getHours();
-  if (hour === 12 || hour === 18) return 90 * 60_000;
-  if (hour >= 22) return 30 * 60_000;
-  return 50 * 60_000;
-}
-
-function healthPool(now) {
-  const hour = new Date(now).getHours();
-  return hour >= 22 || hour < 4 ? HEALTH_POOL.night : HEALTH_POOL.day;
-}
-
-/** 下一个早上 9 点：睡觉时段把下一次推到这里。 */
-function nextMorning(now) {
-  const at = new Date(now);
-  at.setHours(9, 0, 0, 0);
-  if (at.getTime() <= now) at.setDate(at.getDate() + 1);
-  return at.getTime();
-}
 
 function healthState() {
   const raw = loadState().health;
   const saved = raw && typeof raw === 'object' ? raw : {};
+  // v0.7 起每个池各走各的序号；旧状态里的单值 index 当作三个池的起点，迁移无感。
+  const legacyIndex = Number.isFinite(saved.index) ? saved.index : 0;
+  const rawIndexes = saved.indexByPool && typeof saved.indexByPool === 'object' ? saved.indexByPool : {};
+  const pick = (key) => (Number.isFinite(rawIndexes[key]) ? rawIndexes[key] : legacyIndex);
   return {
     enabled: saved.enabled !== false,
     nextAt: Number.isFinite(saved.nextAt) ? saved.nextAt : 0,
-    index: Number.isFinite(saved.index) ? saved.index : 0,
+    indexByPool: { day: pick('day'), night: pick('night'), late: pick('late') },
     mutedUntil: Number.isFinite(saved.mutedUntil) ? saved.mutedUntil : 0,
     lastAt: Number.isFinite(saved.lastAt) ? saved.lastAt : 0,
     lastText: typeof saved.lastText === 'string' ? saved.lastText : '',
@@ -333,7 +342,10 @@ function healthState() {
 
 function saveHealth(patch) {
   updateState((state) => {
-    state.health = { ...healthState(), ...patch };
+    const prev = healthState();
+    const next = { ...prev, ...patch };
+    if (patch.indexByPool) next.indexByPool = { ...prev.indexByPool, ...patch.indexByPool };
+    state.health = next;
   });
 }
 
@@ -366,27 +378,30 @@ async function tickHealth(ctx, { force = false, ephemeral = false } = {}) {
   const health = healthState();
   if (!health.enabled) return null;
   if (health.mutedUntil > now) return null;
-
-  const hour = new Date(now).getHours();
-  if (hour < 9) {
-    if (!health.nextAt || health.nextAt <= now) saveHealth({ nextAt: nextMorning(now) });
-    return null;
+  // 旧版可能留下 22:30、09:00 这种非钟点时间：先对齐到下一个 :00 / :40
+  if (health.nextAt && !SLOT_MINUTES.includes(new Date(health.nextAt).getMinutes())) {
+    health.nextAt = nextSlot(now);
+    saveHealth({ nextAt: health.nextAt });
   }
+
   if (!health.nextAt) {
-    saveHealth({ nextAt: now + healthInterval(now) });
+    saveHealth({ nextAt: nextSlot(now) });
     // 还没排过表就顺手排上；强行试一句（test）时要继续往下弹，不能在这里空手回去
     if (!force) return null;
   }
   if (!force && health.nextAt > now) return null;
   if (!force && !(await someoneAround(ctx))) {
-    saveHealth({ nextAt: now + 10 * 60_000 });
+    // 人不在：不打扰，也不把这一格算成已弹，直接挂到下一个钟点
+    saveHealth({ nextAt: nextSlot(now) });
     return null;
   }
 
   healthBusy = true;
   try {
-    const pool = healthPool(now);
-    const text = pool[health.index % pool.length];
+    const poolName = poolFor(now);
+    const pool = HEALTH_POOL[poolName];
+    const index = health.indexByPool[poolName] ?? 0;
+    const text = pool[index % pool.length];
     await callPet(ctx, {
       method: 'POST',
       path: '/broadcast',
@@ -397,12 +412,17 @@ async function tickHealth(ctx, { force = false, ephemeral = false } = {}) {
       // 试一句不该扰动真节奏：只记下说了什么，不动 nextAt 和轮换序号
       saveHealth({ lastText: text });
     } else {
-      saveHealth({ index: health.index + 1, nextAt: now + healthInterval(now), lastAt: now, lastText: text });
+      saveHealth({
+        indexByPool: { [poolName]: index + 1 },
+        nextAt: nextSlot(now),
+        lastAt: now,
+        lastText: text,
+      });
     }
     return text;
   } catch {
-    // 它睡着或被锁：5 分钟后再来，不占提醒序号
-    saveHealth({ nextAt: now + 5 * 60_000 });
+    // 它睡着或被锁：下一个钟点再来，不占提醒序号
+    saveHealth({ nextAt: nextSlot(now) });
     return null;
   } finally {
     healthBusy = false;
@@ -440,25 +460,16 @@ function startPetMenuLoop(ctx) {
     runtime.clicks += 1;
     const local = MENU_LOCAL[label];
     if (local) {
-      // 这三项不惊动会话，插件自己动手
+      // 这两项不惊动会话，插件自己动手
       try {
         let note;
         if (local === 'look') {
           const { said, imageBytes } = await lookAndTalk(ctx, petId);
           note = said ? `瞄了一眼（${Math.round(imageBytes / 1024)}KB）→ ${said.slice(0, 40)}` : '瞄了一眼，它没接上话';
-        } else if (local === 'mute') {
-          const until = Date.now() + 2 * 3600_000;
-          saveHealth({ mutedUntil: until, nextAt: until + healthInterval(until) });
-          note = `健康提醒静音 2 小时（到 ${new Date(until).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}）`;
         } else {
-          const said = '刷了挺久了吧？站起来走两步，眼睛看看远处。';
-          await callPet(ctx, {
-            method: 'POST',
-            path: '/broadcast',
-            query: { pet: petId, surface: 'any' },
-            body: { text: said, duration: 11_000 },
-          });
-          note = `立刻催了一句：${said}`;
+          const until = Date.now() + 2 * 3600_000;
+          saveHealth({ mutedUntil: until, nextAt: nextSlot(until) });
+          note = `健康提醒静音 2 小时（到 ${new Date(until).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}）`;
         }
         runtime.lastEvent = `${stamp} ${label}（${petId}）→ ${note}`;
         runtime.lastError = '';
@@ -989,7 +1000,7 @@ export function apply(ctx) {
   ctx.tools.register({
     name: 'pet_health',
     description:
-      '管理大肥鱼自己的健康提醒：白天每 50 分钟弹一句（饭点 90 分钟、22 点后改催收工且压到 30 分钟），0–9 点不打扰，内容轮换喝水/起身/远眺/肩颈。action=status 看下一次、test 立刻试一条（不扰动真节奏）、on/off 开关（on 会顺带解除静音）、mute 静音 2 小时。它只弹气泡，不花生成额度。',
+      '管理大肥鱼自己的健康提醒：固定钟点制，每小时 :00 和 :40 各弹一句（夜里也不停），按段落换内容——00–08 半夜池（催睡+关心）、08–20 白天池（休息+活动）、20–24 夜间池（收工+关系）。最近 3 小时没有会话活动就不打扰，推到下一个钟点。action=status 看下一次、test 立刻试一条（不扰动真节奏）、on/off 开关（on 会顺带解除静音）、mute 静音 2 小时。它只弹气泡，不花生成额度。',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1006,16 +1017,19 @@ export function apply(ctx) {
           enabled: { type: 'boolean' },
           nextAtText: { type: 'string' },
           intervalMinutes: { type: 'integer' },
+          segmentText: { type: 'string' },
+          gridText: { type: 'string' },
           mutedUntilText: { type: 'string' },
           said: { type: 'string' },
         },
-        required: ['ok', 'enabled', 'nextAtText', 'intervalMinutes', 'mutedUntilText', 'said'],
+        required: ['ok', 'enabled', 'nextAtText', 'intervalMinutes', 'segmentText', 'gridText', 'mutedUntilText', 'said'],
       },
       render: textRenderer((v) => {
         const bits = [
           `健康提醒：${v.enabled ? '开' : '关'}`,
           `下一次 ${v.nextAtText}`,
-          `间隔 ${v.intervalMinutes} 分钟`,
+          `钟点 ${v.gridText}（${v.segmentText}）`,
+          `距下一次 ${v.intervalMinutes} 分钟`,
         ];
         if (v.mutedUntilText) bits.push(`静音到 ${v.mutedUntilText}`);
         if (v.said) bits.push(`刚说：「${v.said}」`);
@@ -1037,7 +1051,7 @@ export function apply(ctx) {
         saveHealth({ enabled: false });
       } else if (action === 'mute') {
         const until = Date.now() + 2 * 3600_000;
-        saveHealth({ mutedUntil: until, nextAt: until + healthInterval(until) });
+        saveHealth({ mutedUntil: until, nextAt: nextSlot(until) });
       } else if (action === 'test') {
         said = (await tickHealth(ctx, { force: true, ephemeral: true })) ?? '';
         if (!said) throw new Error('pet_health: 没弹出去（可能关着、静音中，或它睡着了）');
@@ -1047,7 +1061,9 @@ export function apply(ctx) {
         ok: true,
         enabled: health.enabled,
         nextAtText: fmt(health.nextAt) || '（还没排）',
-        intervalMinutes: Math.round(healthInterval(Date.now()) / 60_000),
+        intervalMinutes: Math.max(0, Math.round(((health.nextAt || nextSlot(Date.now())) - Date.now()) / 60_000)),
+        segmentText: segmentLabel(Date.now()),
+        gridText: GRID_TEXT,
         mutedUntilText: health.mutedUntil > Date.now() ? fmt(health.mutedUntil) : '',
         said,
       };
@@ -1160,7 +1176,7 @@ export function apply(ctx) {
         const hhmm = (ms) =>
           ms ? new Date(ms).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '未排';
         lines.push(
-          `健康提醒：${health.enabled ? '开' : '关'}${health.mutedUntil > Date.now() ? '（静音中）' : ''}，下一次 ${hhmm(health.nextAt)}`,
+          `健康提醒：${health.enabled ? '开' : '关'}${health.mutedUntil > Date.now() ? '（静音中）' : ''}，下一次 ${hhmm(health.nextAt)}；钟点 ${GRID_TEXT}（${segmentLabel(Date.now())}）`,
         );
         lines.push(`状态文件：${v.stateFile}`);
         return [{ type: 'text', text: lines.join('\n') }];
