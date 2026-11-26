@@ -19,6 +19,13 @@
  * v0.7.0 健康提醒改钟点制：每小时 :00 和 :40 各一次、全天不停，按半夜/白天/夜间三段
  * 换三套话；右键菜单去掉「提醒我歇会儿」——提醒归插件自动做，不再需要手动催。
  *
+ * v0.8.0「三人行」：把大肥鱼的对话记忆当成共享聊天记录。
+ * dsh-pet 是单轮生成、没有工具，它没法自己调工具叫小鲸；但它说的每句话都落在
+ * memory.json 里。所以这里轮询那份记忆：assistant 新回复里带【叫小鲸】标记就
+ * wakeAgent 把我叫起来（smart 模式），all 模式每句都叫（90 秒合并节流），off 只记账不叫。
+ * pet_inbox 让我随时翻全部对话，pet_trio 切模式；右键菜单补一项「把鱼刚说的递过去」，
+ * 手点也能立刻把它的原话搬到我这边。全程只读 dsh-pet 的数据文件，不碰它的代码。
+ *
  * dsh-pet 的宿主服务只暴露余额/语音/记忆插槽，没有对话、气泡、待办、菜单的口子；
  * 那些能力都挂在网页端口的 `/dsh-pet-7340` 前缀下，所以这里只走 HTTP 契约，不 import 它。
  */
@@ -40,7 +47,9 @@ const SURFACES = ['any', 'web', 'desktop', 'both'];
 
 /** 右键菜单 owner（一个 owner 一份整体覆盖的列表）。 */
 const MENU_OWNER = 'pet-link';
-const MENU_LABELS = ['小鲸，来一下', '一起看会儿视频', '瞄一眼我这边', '静音 2 小时'];
+const MENU_LABELS = ['小鲸，来一下', '把鱼刚说的递过去', '一起看会儿视频', '瞄一眼我这边', '静音 2 小时'];
+/** 这项不投固定文案，而是读大肥鱼最后一句原话投过去。 */
+const MENU_DELIVER = '把鱼刚说的递过去';
 /** 点菜单之后投给会话的原话；前缀让它一眼看出不是用户手打的。 */
 const MENU_TEXT = {
   '小鲸，来一下': '〔大肥鱼〕小鲸，主人戳了我一下。你抬头应一声，看看他要做什么。（这是主人在我右键菜单上点的，不是自动消息。）',
@@ -168,6 +177,161 @@ function updateState(mutate) {
   saveState(state);
   return state;
 }
+
+// ── 三人行：大肥鱼的对话记忆 ↔ 我这头 ─────────────────────────────────────────
+//
+// dsh-pet 的对话全落在 memory.json：{ <桶>: { <petId>: { messages: [{role,content,ts,...}] } } }。
+// 它是单轮生成、没有工具，没法自己调工具叫我；但它说的每句话都在这里。
+// 这一节只读那份文件（不碰 dsh-pet 代码，升级不丢）：
+//   pollTrio  轮询新增回复，带【叫小鲸】标记就 wakeAgent 叫我；all 模式每句都叫
+//   pet_inbox 随时翻全部对话，「未读」按 state.trio.lastReadTs 算
+//   pet_trio  切 smart / all / off
+// 同步游标用「消息条数」而不是 ts：同一次对话的 user/assistant 可能共用同一个 ts。
+
+/** 唤醒标记：它写【叫小鲸】【〔叫小鲸〕】【[叫小鲸]】都算。 */
+const WAKE_MARK_RE = /[【〔\[]\s*叫\s*小鲸\s*[】〕\]]/;
+/** 一条递过来的话最多截多长。 */
+const TRIO_TEXT_MAX = 800;
+/** all 模式两次唤醒之间至少隔多久（合并这一窗口里的多条）。 */
+const TRIO_ALL_GAP_MS = 90_000;
+
+/** 记忆文件位置：环境变量 → ~/.dsh/dsh-pet/memory.json（Junction，最稳）→ D 盘小屋。 */
+function resolveMemoryPath() {
+  const candidates = [];
+  if (process.env.DSH_PET_MEMORY) candidates.push(process.env.DSH_PET_MEMORY);
+  try {
+    candidates.push(path.join(os.homedir(), '.dsh', 'dsh-pet', 'memory.json'));
+  } catch {
+    /* ignore */
+  }
+  candidates.push('D:\\DSH_DATA\\大肥鱼\\memory.json');
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch {
+      /* ignore */
+    }
+  }
+  return candidates[0] ?? 'memory.json';
+}
+
+/** 读某只宠物的对话消息；结构不对/文件缺失一律当空，不让轮询崩。 */
+function readChatMessages(petId) {
+  const file = resolveMemoryPath();
+  let raw;
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch {
+    return { file, messages: [] };
+  }
+  let mem;
+  try {
+    mem = JSON.parse(raw);
+  } catch {
+    return { file, messages: [] };
+  }
+  if (!mem || typeof mem !== 'object' || Array.isArray(mem)) return { file, messages: [] };
+  for (const bucket of Object.values(mem)) {
+    if (!bucket || typeof bucket !== 'object' || Array.isArray(bucket)) continue;
+    const leaf = bucket[petId];
+    if (leaf && Array.isArray(leaf.messages)) return { file, messages: leaf.messages };
+  }
+  return { file, messages: [] };
+}
+
+function trioState() {
+  const state = loadState();
+  const trio = state.trio && typeof state.trio === 'object' ? state.trio : {};
+  return {
+    enabled: trio.enabled !== false,
+    mode: trio.mode === 'all' || trio.mode === 'off' ? trio.mode : 'smart',
+    cursorCount: Number.isFinite(trio.cursorCount) ? trio.cursorCount : -1,
+    lastReadTs: Number.isFinite(trio.lastReadTs) ? trio.lastReadTs : 0,
+    lastWakeAt: Number.isFinite(trio.lastWakeAt) ? trio.lastWakeAt : 0,
+    woken: Number.isFinite(trio.woken) ? trio.woken : 0,
+    lastWakeText: typeof trio.lastWakeText === 'string' ? trio.lastWakeText : '',
+    lastError: typeof trio.lastError === 'string' ? trio.lastError : '',
+  };
+}
+
+function saveTrio(patch) {
+  updateState((state) => {
+    state.trio = { ...trioState(), ...patch };
+  });
+}
+
+/** pet_chat 完事后把游标推到最新，免得自己刚问出来的回复又被轮询当成「鱼的来信」。 */
+function syncTrioCursor(petId = DEFAULT_PET) {
+  const { messages } = readChatMessages(petId);
+  if (messages.length) saveTrio({ cursorCount: messages.length });
+}
+
+/** 把一条（或几条合并的）鱼的话裁成适合投递的一段。 */
+function trioTextOf(messages) {
+  const parts = [];
+  for (const message of messages) {
+    if (!message || typeof message.content !== 'string') continue;
+    const flat = message.content.replace(WAKE_MARK_RE, '').replace(/\s+/g, ' ').trim();
+    if (!flat) continue;
+    parts.push(
+      flat.length > TRIO_TEXT_MAX ? `${flat.slice(0, TRIO_TEXT_MAX - 1)}…（全文见 pet_inbox）` : flat,
+    );
+  }
+  return parts.join('\n');
+}
+
+/** 后台轮询：把新出现的 assistant 回复按模式处理。失败只记 lastError，不炸循环。 */
+async function pollTrio(ctx, runtime) {
+  const trio = trioState();
+  if (!trio.enabled || trio.mode === 'off') return;
+  const { messages } = readChatMessages(DEFAULT_PET);
+  if (!messages.length) return;
+  if (trio.cursorCount < 0 || messages.length < trio.cursorCount) {
+    // 首次运行 / 文件被清空重写：只把游标锚到现在，不补投历史
+    saveTrio({ cursorCount: messages.length, lastError: '' });
+    return;
+  }
+  if (messages.length === trio.cursorCount) return;
+  const fresh = messages.slice(trio.cursorCount);
+  const assistants = fresh.filter(
+    (m) => m && m.role === 'assistant' && typeof m.content === 'string' && m.content.trim(),
+  );
+  const marked = assistants.filter((m) => WAKE_MARK_RE.test(m.content));
+  const wanted = trio.mode === 'all' ? assistants : marked;
+  if (!wanted.length) {
+    saveTrio({ cursorCount: messages.length });
+    return;
+  }
+  // all 模式：留到节流窗口过去再一起投，未到点就不推进游标
+  const now = Date.now();
+  if (trio.mode === 'all' && now - trio.lastWakeAt < TRIO_ALL_GAP_MS) return;
+
+  const text = trioTextOf(wanted);
+  if (!text) {
+    saveTrio({ cursorCount: messages.length });
+    return;
+  }
+  try {
+    if (await targetSessionBusy(ctx).catch(() => false)) {
+      // 主人那边正忙着：这一轮先不投，游标也不推进，等它闲下来再递
+      runtime.lastTrio = `${new Date().toISOString()} 等主人这一轮跑完再递`;
+      return;
+    }
+    const sessionId = await wakeAgent(ctx, `〔大肥鱼〕${text}`);
+    saveTrio({
+      cursorCount: messages.length,
+      lastWakeAt: now,
+      woken: trio.woken + 1,
+      lastWakeText: text.slice(0, 200),
+      lastError: '',
+    });
+    runtime.lastTrio = `${new Date().toISOString()} 叫醒 …${String(sessionId).slice(-8)}`;
+  } catch (err) {
+    // 投不进去也推进游标：按「推送失败就跳过」的老规矩，不反复重试
+    saveTrio({ cursorCount: messages.length, lastWakeAt: now, lastError: String(err?.message ?? err) });
+  }
+}
+
 
 /** 装上的是哪个版本：排障时不用翻 node_modules。 */
 function pluginVersion() {
@@ -429,9 +593,228 @@ async function tickHealth(ctx, { force = false, ephemeral = false } = {}) {
   }
 }
 
+// ── 眼睛：它自己看表，隔一阵瞄一眼主人 ──────────────────────────────────────
+//
+// 分工：看（截图）归宿主侧——它没有腿；说什么归它。节奏一分钟一轮的循环里顺带判断，
+// 但真正探测/截图只在「到点 + 前台不是会议/视频」时发生，平时几乎零开销。
+// 问一下再截：probe.py 只读 GetLastInputInfo / 前台窗口，不碰画面。
+
+const EYE_DEFAULT_INTERVAL_MIN = 15;
+const EYE_MIN_INTERVAL_MIN = 10;
+const EYE_MAX_INTERVAL_MIN = 30;
+/** 到点但主人正在动手 / 在开会，隔这么久再判断一次（不然每 9 秒探一回）。 */
+const EYE_RETRY_MS = 5 * 60_000;
+/** 学习/工作时降到一半频率：间隔翻倍。 */
+const EYE_STUDY_FACTOR = 2;
+/** 同一状态十分钟内只说一回（第四条规矩）。 */
+const EYE_MIN_GAP_MS = 10 * 60_000;
+/** 会议 / 网课 / 共享屏幕一律不看也不说话：屏幕上可能是别人的脸和别人的文档。 */
+const EYE_MEETING_EXE =
+  /^(zoom|teams|ms-teams|webex|webexmta|meet|skype|wemeet|wemeetapp|tencentmeeting|discord|classin|dingtalk)/i;
+const EYE_MEETING_TITLE =
+  /(Google Meet|Zoom 会议|Zoom Meeting|腾讯会议|Teams 会议|Webex|ClassIn|雨课堂|钉钉|正在共享|共享屏幕|屏幕共享)/i;
+/** 学习 / 工作：写东西、看文献、写代码 —— 说话降到低频。 */
+const EYE_STUDY_EXE =
+  /^(code|code-insiders|cursor|winword|excel|powerpnt|acrord32|acrobat|sumatrapdf|notepad|notepad\+\+|obsidian|typora|sublime_text|pycharm64|idea64|webstorm64|goland64|clion64|matlab|rstudio|zotero|mstsc|onedrive|onenote)/i;
+const EYE_STUDY_TITLE =
+  /(Google Docs|Google Sheets|Google Slides|Overleaf|LaTeX|\.tex\b|PDF|Coursera|Canvas|D2L|Brightspace|笔记|作业|论文|讲义|习题)/i;
+/** 看视频：算「别打扰」，不看不吭声（主人 2026-11-25 的新规矩）。 */
+const EYE_VIDEO_TITLE =
+  /(YouTube|哔哩哔哩|bilibili|Netflix|腾讯视频|爱奇艺|优酷|芒果TV|Twitch|Prime Video|Disney\+|VLC|PotPlayer|MPC-HC|播放器|正在播放)/i;
+/** 打游戏：正常频率，随便说。 */
+const EYE_PLAY_TITLE = /(Steam|Minecraft|英雄联盟|League of Legends|原神|Genshin|CS2|Counter-Strike|VALORANT)/i;
+
+function eyeState() {
+  const raw = loadState().eye;
+  const eye = raw && typeof raw === 'object' ? raw : {};
+  const interval = Number(eye.intervalMinutes);
+  return {
+    enabled: eye.enabled !== false,
+    intervalMinutes: Number.isFinite(interval)
+      ? Math.min(EYE_MAX_INTERVAL_MIN, Math.max(EYE_MIN_INTERVAL_MIN, Math.round(interval)))
+      : EYE_DEFAULT_INTERVAL_MIN,
+    lastEyeAt: Number(eye.lastEyeAt) || 0,
+    lastCheckAt: Number(eye.lastCheckAt) || 0,
+    lastSaid: typeof eye.lastSaid === 'string' ? eye.lastSaid : '',
+    lastSkip: typeof eye.lastSkip === 'string' ? eye.lastSkip : '',
+    lastError: typeof eye.lastError === 'string' ? eye.lastError : '',
+    lastState: typeof eye.lastState === 'string' ? eye.lastState : '',
+    mutedUntil: Number(eye.mutedUntil) || 0,
+    fired: Number(eye.fired) || 0,
+  };
+}
+
+function saveEye(patch) {
+  const state = updateState((s) => {
+    const cur = s.eye && typeof s.eye === 'object' ? s.eye : {};
+    s.eye = { ...cur, ...patch };
+  });
+  return state.eye;
+}
+
+/** 跑 probe.py 拿 {idleSeconds, foreground:{title,exe,pid}}。 */
+function runProbe(python) {
+  return new Promise((resolve, reject) => {
+    const script = path.join(path.dirname(fileURLToPath(import.meta.url)), 'probe.py');
+    const child = spawn(python, [script], { windowsHide: true });
+    const out = [];
+    let err = '';
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error('pet-link: 环境探测超时'));
+    }, 8_000);
+    child.stdout.on('data', (chunk) => out.push(chunk));
+    child.stderr.on('data', (chunk) => {
+      err += chunk.toString();
+    });
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        reject(new Error(`pet-link: 环境探测失败（${python} exit ${code}）${err.trim().slice(0, 160)}`));
+        return;
+      }
+      try {
+        resolve(JSON.parse(Buffer.concat(out).toString('utf8')));
+      } catch {
+        reject(new Error('pet-link: 环境探测输出不是 JSON'));
+      }
+    });
+  });
+}
+
+async function probeDesktop() {
+  let lastError = null;
+  for (const python of pythonCandidates()) {
+    try {
+      return await runProbe(python);
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  throw lastError ?? new Error('pet-link: 找不到可用的 python');
+}
+
+/** 前台属于哪一类：meeting（开会/网课）/ study（学习工作）/ play（游戏视频）/ other / none。 */
+function classifyDesktop(probe) {
+  const title = String(probe?.foreground?.title ?? '').trim();
+  const exeName = String(probe?.foreground?.exe ?? '').split(/[\\/]/).pop().replace(/\.exe$/i, '');
+  if (!title) return { state: 'none', reason: '前台没有窗口（锁屏或刚切换）' };
+  if (EYE_MEETING_EXE.test(exeName) || EYE_MEETING_TITLE.test(title)) {
+    return { state: 'meeting', reason: '主人在开会/上网课' };
+  }
+  if (EYE_VIDEO_TITLE.test(title)) return { state: 'video', reason: '主人在看视频' };
+  if (EYE_PLAY_TITLE.test(title)) return { state: 'play', reason: '' };
+  if (EYE_STUDY_EXE.test(exeName) || EYE_STUDY_TITLE.test(title)) return { state: 'study', reason: '' };
+  return { state: 'other', reason: '' };
+}
+
+/** 这一类的节奏：学习/工作时间隔翻倍，其余按默认。 */
+function eyeIntervalMs(eye, state) {
+  const minutes = Math.min(
+    EYE_MAX_INTERVAL_MIN,
+    eye.intervalMinutes * (state === 'study' ? EYE_STUDY_FACTOR : 1),
+  );
+  return minutes * 60_000;
+}
+
+const EYE_STATE_TEXT = {
+  study: '主人在学习/干活',
+  play: '主人在打游戏',
+  video: '主人在看视频',
+  other: '主人在用电脑',
+};
+
+/** 到点了才探：先问环境，过了闸门才截图+生成。平时几乎零开销。 */
+async function eyeTick(ctx, runtime) {
+  const eye = eyeState();
+  if (!eye.enabled) return false;
+  const now = Date.now();
+  if (eye.mutedUntil > now) return false;
+  if (now - eye.lastCheckAt < EYE_RETRY_MS) return false;
+  // 先用最短的节奏挡一道，省掉绝大多数探测
+  if (now - eye.lastEyeAt < eye.intervalMinutes * 60_000) return false;
+  if (now - eye.lastEyeAt < EYE_MIN_GAP_MS) return false;
+  saveEye({ lastCheckAt: now });
+
+  let probe;
+  try {
+    probe = await probeDesktop();
+  } catch (err) {
+    const message = String(err?.message ?? err);
+    saveEye({ lastError: message });
+    if (runtime) runtime.lastEye = `环境探测失败：${message.slice(0, 60)}`;
+    return false;
+  }
+
+  const kind = classifyDesktop(probe);
+  if (kind.state === 'meeting' || kind.state === 'video' || kind.state === 'none') {
+    saveEye({ lastSkip: kind.reason, lastError: '', lastState: kind.state });
+    if (runtime) runtime.lastEye = `到点了，但${kind.reason}，先不看`;
+    return false;
+  }
+  // 学习/工作要等更久：间隔翻倍
+  if (now - eye.lastEyeAt < eyeIntervalMs(eye, kind.state)) {
+    saveEye({ lastSkip: '', lastState: kind.state });
+    if (runtime) runtime.lastEye = `${EYE_STATE_TEXT[kind.state]}，这一轮按低频跳过`;
+    return false;
+  }
+  const title = String(probe.foreground.title).replace(/\s+/g, ' ').trim().slice(0, 50);
+  const where = EYE_STATE_TEXT[kind.state] ?? '主人在用电脑';
+  try {
+    const { said, imageBytes } = await lookAndTalk(
+      ctx,
+      DEFAULT_PET,
+      `${where}（前台窗口「${title}」）。这是没人追问时你自己看一眼，简短一两句就行。`,
+    );
+    saveEye({
+      lastEyeAt: Date.now(),
+      lastSaid: said,
+      lastSkip: '',
+      lastError: '',
+      lastState: kind.state,
+      fired: eyeState().fired + 1,
+    });
+    if (runtime) runtime.lastEye = `瞄了一眼「${title}」（${Math.round(imageBytes / 1024)}KB）→ ${said.slice(0, 40)}`;
+    return true;
+  } catch (err) {
+    const message = String(err?.message ?? err);
+    // 失败也把 lastEyeAt 推到现在：按「推不了就不推」不重试
+    saveEye({ lastEyeAt: Date.now(), lastError: message });
+    if (runtime) runtime.lastEye = `瞄一眼失败：${message.slice(0, 60)}`;
+    return false;
+  }
+}
+
+/** 主人点名要看：跳过时间闸门，但仍避开会议/网课。 */
+async function eyeLookNow(ctx, hint = '', petId = DEFAULT_PET) {
+  const probe = await probeDesktop().catch(() => null);
+  const title = probe ? String(probe.foreground.title).replace(/\s+/g, ' ').trim().slice(0, 50) : '';
+  if (probe) {
+    const kind = classifyDesktop(probe);
+    if (kind.state === 'meeting') throw new Error(`pet-link: ${kind.reason}，这次不截屏`);
+  }
+  const extra = [title ? `主人正在用「${title}」` : '', hint].filter(Boolean).join('，');
+  const { said, imageBytes } = await lookAndTalk(ctx, petId, extra);
+  saveEye({ lastEyeAt: Date.now(), lastSaid: said, lastSkip: '', lastError: '', fired: eyeState().fired + 1 });
+  return { said, imageBytes };
+}
+
 // ── 反向通道：菜单 → 会话 ───────────────────────────────────────────────────
 
 /** 把一条文本投进最近活动的会话，等于替用户敲了一句话。 */
+function pickTargetSession(sc, signal) {
+  return sc.list({}, signal).then((listed) => {
+    const items = Array.isArray(listed?.items) ? listed.items : [];
+    const target = items.find((item) => item && typeof item.sessionId === 'string' && item.sessionId);
+    if (!target) throw new Error('pet-link: 没有可投递的会话');
+    return target.sessionId;
+  });
+}
+
 async function wakeAgent(ctx, text) {
   const sc = ctx.get('sessionController');
   if (!sc) throw new Error('pet-link: sessionController 服务不可用');
@@ -439,20 +822,28 @@ async function wakeAgent(ctx, text) {
     throw new Error('pet-link: sessionController 上没有 list/prompt');
   }
   const signal = AbortSignal.timeout(15_000);
-  const listed = await sc.list({}, signal);
-  const items = Array.isArray(listed?.items) ? listed.items : [];
-  const target = items.find((item) => item && typeof item.sessionId === 'string' && item.sessionId);
-  if (!target) throw new Error('pet-link: 没有可投递的会话');
-  await sc.prompt(
-    { sessionId: target.sessionId, content: [{ type: 'text', text }], requestId: randomUUID() },
-    signal,
-  );
-  return target.sessionId;
+  const sessionId = await pickTargetSession(sc, signal);
+  await sc.prompt({ sessionId, content: [{ type: 'text', text }], requestId: randomUUID() }, signal);
+  return sessionId;
+}
+
+/**
+ * 目标会话正忙（这一轮还没跑完 / 输入框里压着排队消息）时先别投。
+ * 硬投会塞进输入队列，界面上看着像主人自己打了一句没发出去的话。
+ */
+async function targetSessionBusy(ctx) {
+  const sc = ctx.get('sessionController');
+  if (!sc || typeof sc.list !== 'function' || typeof sc.state !== 'function') return false;
+  const signal = AbortSignal.timeout(15_000);
+  const sessionId = await pickTargetSession(sc, signal);
+  const state = await sc.state({ sessionId }, signal);
+  const queued = Array.isArray(state?.queue) ? state.queue.length : 0;
+  return Boolean(state && (state.running || queued > 0));
 }
 
 /** 后台循环：注册菜单 → 长轮询点击 → 投会话。失败退避重试，宠物晚启动也能接上。 */
 function startPetMenuLoop(ctx) {
-  const runtime = { registered: false, lastEvent: '', lastError: '', clicks: 0 };
+  const runtime = { registered: false, lastEvent: '', lastError: '', clicks: 0, lastTrio: '', lastEye: '' };
   let disposed = false;
 
   const handleClick = async (label, petId) => {
@@ -469,7 +860,9 @@ function startPetMenuLoop(ctx) {
         } else {
           const until = Date.now() + 2 * 3600_000;
           saveHealth({ mutedUntil: until, nextAt: nextSlot(until) });
-          note = `健康提醒静音 2 小时（到 ${new Date(until).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}）`;
+          // 「静音 2 小时」连眼睛一起停：不能嘴上安静、背地里还在截屏
+          saveEye({ mutedUntil: until });
+          note = `静音 2 小时：提醒和眼睛都停（到 ${new Date(until).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}）`;
         }
         runtime.lastEvent = `${stamp} ${label}（${petId}）→ ${note}`;
         runtime.lastError = '';
@@ -486,6 +879,24 @@ function startPetMenuLoop(ctx) {
         } catch {
           /* 连播报都失败就算了 */
         }
+      }
+      return;
+    }
+    if (label === MENU_DELIVER) {
+      try {
+        const { messages } = readChatMessages(petId);
+        const last = [...messages]
+          .reverse()
+          .find((m) => m && m.role === 'assistant' && typeof m.content === 'string' && m.content.trim());
+        if (!last) throw new Error('它还没说过话');
+        const said = last.content.replace(WAKE_MARK_RE, '').replace(/\s+/g, ' ').trim().slice(0, 900);
+        syncTrioCursor(petId);
+        const sessionId = await wakeAgent(ctx, `〔大肥鱼〕${said}`);
+        runtime.lastEvent = `${stamp} ${label}（${petId}）→ 已投递 …${sessionId.slice(-8)}`;
+        runtime.lastError = '';
+      } catch (err) {
+        runtime.lastEvent = `${stamp} ${label}（${petId}）→ 失败`;
+        runtime.lastError = String(err?.message ?? err);
       }
       return;
     }
@@ -516,6 +927,10 @@ function startPetMenuLoop(ctx) {
       try {
         // 每轮（约 9 秒）顺带问一次健康节奏该不该吱声
         await tickHealth(ctx).catch(() => {});
+        // 顺带看一眼大肥鱼有没有新说的话（三人行的反向通道）
+        await pollTrio(ctx, runtime).catch(() => {});
+        // 眼睛：到点、非会议/视频才瞄一眼（多数轮次在这里一行就返回）
+        await eyeTick(ctx, runtime).catch(() => {});
         if (!runtime.registered) {
           await callPet(ctx, { method: 'POST', path: '/menu/item', body: { owner: MENU_OWNER, labels: MENU_LABELS, target: 'both' } });
           runtime.registered = true;
@@ -795,6 +1210,7 @@ export function apply(ctx) {
       const data = await callPet(ctx, { method: 'POST', path: '/chat', query: { pet, surface }, body: { text }, timeoutMs: 120_000 });
       const reply = typeof data?.text === 'string' ? data.text : '';
       if (!reply) throw new Error('pet-link: 对话成功但没拿到回复文本');
+      syncTrioCursor(pet);
       return {
         ok: true,
         pet,
@@ -996,6 +1412,158 @@ export function apply(ctx) {
     },
   });
 
+  // ── pet_inbox：翻大肥鱼那边的聊天记录 ──────────────────────────────────
+  ctx.tools.register({
+    name: 'pet_inbox',
+    description:
+      '翻大肥鱼那边的聊天记录（它说的和主人对它说的都在 memory.json 里），不用等它主动叫你。默认返回自上次读过以后的新消息；markRead=true 顺手记已读。action=read 读，action=mark 只记已读到最新。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: { type: 'string', enum: ['read', 'mark'], description: '默认 read。' },
+        limit: { type: 'integer', description: '最多返回多少条，默认 20，上限 100。' },
+        sinceTs: { type: 'integer', description: '只要 ts 大于这个毫秒时间戳的消息；给了就忽略已读游标。' },
+        pet: { type: 'string', description: '桌宠 id，默认 main。' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          file: { type: 'string' },
+          total: { type: 'integer' },
+          unread: { type: 'integer' },
+          messages: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                role: { type: 'string' },
+                text: { type: 'string' },
+                ts: { type: 'integer' },
+              },
+              required: ['role', 'text', 'ts'],
+            },
+          },
+        },
+        required: ['ok', 'file', 'total', 'unread', 'messages'],
+      },
+      render: (_a, v) => {
+        const lines = [`大肥鱼的对话：共 ${v.total} 条，未读 ${v.unread} 条`];
+        for (const m of v.messages) {
+          const when = m.ts ? new Date(m.ts).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
+          lines.push(`${m.role === 'assistant' ? '大肥鱼' : '主人'}（${when}）：${m.text}`);
+        }
+        return [{ type: 'text', text: lines.join('\n') }];
+      },
+    },
+    isConcurrencySafe: () => true,
+    async execute(args) {
+      const action = String(args.action ?? 'read');
+      if (!['read', 'mark'].includes(action)) throw new Error('pet_inbox: action 只能是 read / mark');
+      const pet = petIdOf(args.pet);
+      let limit = 20;
+      if (args.limit !== undefined) {
+        limit = Number(args.limit);
+        if (!Number.isFinite(limit) || limit < 1 || limit > 100) throw new Error('pet_inbox: limit 必须是 1–100');
+      }
+      const { file, messages } = readChatMessages(pet);
+      const trio = trioState();
+      const lastTs = Number.isFinite(args.sinceTs) ? Number(args.sinceTs) : trio.lastReadTs;
+      const rows = messages
+        .filter((m) => m && typeof m.content === 'string' && Number(m.ts ?? 0) > lastTs)
+        .map((m) => ({
+          role: m.role === 'assistant' ? 'assistant' : 'user',
+          text: String(m.content).slice(0, 1200),
+          ts: Number(m.ts ?? 0),
+        }));
+      const unread = rows.length;
+      if (action === 'mark' && messages.length) {
+        const newest = messages[messages.length - 1];
+        saveTrio({ lastReadTs: Number(newest?.ts ?? Date.now()) });
+      }
+      const shown = rows.slice(-limit);
+      if (action === 'read' && shown.length) {
+        saveTrio({ lastReadTs: Math.max(trio.lastReadTs, shown[shown.length - 1].ts) });
+      }
+      return { ok: true, file, total: messages.length, unread, messages: shown };
+    },
+  });
+
+  // ── pet_trio：三人行模式 ────────────────────────────────────────────────
+  ctx.tools.register({
+    name: 'pet_trio',
+    description:
+      '配置「三人行」：大肥鱼说的话怎样传到我这里。smart=它写【叫小鲸】时才把我叫醒（默认，省 token）；all=它每说一句都叫醒我（90 秒合并一次，会费生成额度）；off=都不叫，只记在 pet_inbox 里。status 看现状。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['status', 'smart', 'all', 'off'],
+          description: '默认 status。',
+        },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          mode: { type: 'string' },
+          enabled: { type: 'boolean' },
+          cursorCount: { type: 'integer' },
+          total: { type: 'integer' },
+          woken: { type: 'integer' },
+          lastWakeText: { type: 'string' },
+          lastError: { type: 'string' },
+          memoryFile: { type: 'string' },
+        },
+        required: ['ok', 'mode', 'enabled', 'cursorCount', 'total', 'woken', 'lastWakeText', 'lastError', 'memoryFile'],
+      },
+      render: (_a, v) => [
+        {
+          type: 'text',
+          text: [
+            `三人行：${v.mode}${v.enabled ? '' : '（已停用）'}｜已累计叫醒 ${v.woken} 次`,
+            `记忆文件：${v.memoryFile}（共 ${v.total} 条，游标 ${v.cursorCount}）`,
+            v.lastWakeText ? `最近叫醒内容：${v.lastWakeText}` : '',
+            v.lastError ? `最近错误：${v.lastError}` : '',
+          ]
+            .filter(Boolean)
+            .join('\n'),
+        },
+      ],
+    },
+    isConcurrencySafe: () => true,
+    async execute(args) {
+      const action = String(args.action ?? 'status');
+      if (!['status', 'smart', 'all', 'off'].includes(action)) {
+        throw new Error('pet_trio: action 只能是 status / smart / all / off');
+      }
+      if (action !== 'status') saveTrio({ mode: action, enabled: action !== 'off' });
+      const trio = trioState();
+      const { file, messages } = readChatMessages(DEFAULT_PET);
+      return {
+        ok: true,
+        mode: trio.mode,
+        enabled: trio.enabled,
+        cursorCount: trio.cursorCount,
+        total: messages.length,
+        woken: trio.woken,
+        lastWakeText: trio.lastWakeText,
+        lastError: trio.lastError,
+        memoryFile: file,
+      };
+    },
+  });
+
   // ── pet_health：健康节奏 ────────────────────────────────────────────────
   ctx.tools.register({
     name: 'pet_health',
@@ -1065,6 +1633,113 @@ export function apply(ctx) {
         segmentText: segmentLabel(Date.now()),
         gridText: GRID_TEXT,
         mutedUntilText: health.mutedUntil > Date.now() ? fmt(health.mutedUntil) : '',
+        said,
+      };
+    },
+  });
+
+  // ── pet_eye：它自己的眼睛 ───────────────────────────────────────────────
+  ctx.tools.register({
+    name: 'pet_eye',
+    description:
+      '管大肥鱼自己的「眼睛」：宿主后台按间隔（默认 15 分钟，可调 10–30）替它瞄一眼屏幕，随时可看，不再等主人停手——只留一个例外：主人在开会/上网课/看视频时不看不吭声；学习/工作间隔翻倍（最多 30 分钟），打游戏按正常节奏；看完由它自己随意说一两句，不推进会话。右键菜单的「静音 2 小时」会连它一起停。action=status 看状态与上次结果；now/test 立刻看一次（跳过时间闸门，仍避开会议）；on/off 开关（on 解除静音）；interval 改间隔（要给 minutes，10–30）。',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['status', 'now', 'test', 'on', 'off', 'interval'],
+          description: '默认 status。',
+        },
+        minutes: { type: 'integer', minimum: 10, maximum: 30, description: '仅 interval 用：间隔分钟数（10–30）。' },
+        hint: { type: 'string', description: '仅 now/test 用：要它重点看什么（不超过 120 字）。' },
+        pet: { type: 'string', description: '桌宠 id，默认 main。' },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          enabled: { type: 'boolean' },
+          intervalMinutes: { type: 'integer' },
+          nextAtText: { type: 'string' },
+          fired: { type: 'integer' },
+          lastSaid: { type: 'string' },
+          lastSkip: { type: 'string' },
+          lastError: { type: 'string' },
+          lastState: { type: 'string' },
+          mutedUntilText: { type: 'string' },
+          said: { type: 'string' },
+        },
+        required: [
+          'ok',
+          'enabled',
+          'intervalMinutes',
+          'nextAtText',
+          'fired',
+          'lastSaid',
+          'lastSkip',
+          'lastError',
+          'lastState',
+          'mutedUntilText',
+          'said',
+        ],
+      },
+      render: textRenderer((v) =>
+        [
+          `眼睛：${v.enabled ? '开' : '关'}｜每 ${v.intervalMinutes} 分钟（学习/工作翻倍，封顶 30）｜下一次 ${v.nextAtText}｜累计 ${v.fired} 次`,
+          v.mutedUntilText ? `静音到 ${v.mutedUntilText}` : '',
+          v.lastSaid ? `上次看到：「${v.lastSaid}」` : '',
+          v.lastSkip ? `上次跳过：${v.lastSkip}` : '',
+          v.lastError ? `上次错误：${v.lastError}` : '',
+          v.said ? `刚看：${v.said}` : '',
+        ]
+          .filter(Boolean)
+          .join('\n'),
+      ),
+    },
+    isConcurrencySafe: () => false,
+    async execute(args) {
+      const action = String(args.action ?? 'status');
+      const fmt = (ms) =>
+        ms
+          ? new Date(ms).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+          : '';
+      let said = '';
+      if (action === 'on') {
+        saveEye({ enabled: true, lastCheckAt: 0, mutedUntil: 0 });
+      } else if (action === 'off') {
+        saveEye({ enabled: false });
+      } else if (action === 'interval') {
+        const minutes = Number(args.minutes);
+        if (!Number.isFinite(minutes)) throw new Error('pet_eye: 改间隔要给 minutes（10–30）');
+        saveEye({
+          intervalMinutes: Math.min(EYE_MAX_INTERVAL_MIN, Math.max(EYE_MIN_INTERVAL_MIN, Math.round(minutes))),
+          lastCheckAt: 0,
+        });
+      } else if (action === 'now' || action === 'test') {
+        const hint = String(args.hint ?? '').slice(0, 120);
+        const { said: own } = await eyeLookNow(ctx, hint, petIdOf(args.pet));
+        said = own;
+        if (!said) throw new Error('pet_eye: 看了，但它没说话');
+      }
+      const eye = eyeState();
+      const muted = eye.mutedUntil > Date.now();
+      const nextAt = eye.enabled && !muted ? Math.max(eye.lastEyeAt, eye.lastCheckAt) + eyeIntervalMs(eye, eye.lastState) : 0;
+      return {
+        ok: true,
+        enabled: eye.enabled,
+        intervalMinutes: eye.intervalMinutes,
+        nextAtText: nextAt ? fmt(nextAt) : muted ? '（静音中）' : '（关着）',
+        fired: eye.fired,
+        lastSaid: eye.lastSaid,
+        lastSkip: eye.lastSkip,
+        lastError: eye.lastError,
+        lastState: eye.lastState,
+        mutedUntilText: muted ? fmt(eye.mutedUntil) : '',
         said,
       };
     },
